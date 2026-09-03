@@ -57,6 +57,7 @@ class HistoricalRecord:
     unit_price: Optional[float] = None
     date: Optional[str] = None  # ISO date string, sortable; None sorts last
     source: str = ""
+    provenance: str = ""  # e.g. 'likely_po_or_negotiation_working_file' -- see workbook_provenance.py
 
 
 @dataclass

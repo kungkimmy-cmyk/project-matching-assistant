@@ -25,9 +25,63 @@ DIGIT_RUN_RE = re.compile(r"\d{3,}")
 
 _COLOR_SUFFIX_RE = re.compile(r"^[A-Z]\d{3}$", re.IGNORECASE)
 
+# Fallback finish/glaze prefixes used when no MatcherConfig is available
+# at the call site (kept in sync with config.py's
+# reactive_glaze_code_prefixes default; pass cfg explicitly wherever
+# possible instead of relying on this fallback).
+_DEFAULT_FINISH_PREFIXES = ("MG", "ND")
 
-def _is_likely_color_suffix(token: str) -> bool:
-    return bool(_COLOR_SUFFIX_RE.match(token))
+
+def _is_likely_color_suffix(token: str, cfg=None) -> bool:
+    """True if `token` looks like a finish/glaze/colour code rather
+    than a factory Part No. -- e.g. 'N349' (a single-letter + 3-digit
+    colour suffix, like the Mustard Rim example found earlier) OR
+    'MG007'/'ND008' (a two-letter reactive-glaze code, per real-file
+    validation: DB3H11328-MG007's ONLY regex match was 'MG007', since
+    'H11328' fails the factory-code lookbehind when glued directly to
+    'DB3' with no separator -- 'MG007' was then wrongly accepted as
+    the factory code because it followed a hyphen).
+
+    Generalized (not hardcoded to 'MG007' specifically): checks against
+    cfg.reactive_glaze_code_prefixes when a config is supplied, so any
+    newly observed finish-code family can be added via config, not a
+    code change -- same pattern as every other tunable list in this
+    project."""
+    if _COLOR_SUFFIX_RE.match(token):
+        return True
+    prefixes = cfg.reactive_glaze_code_prefixes if cfg is not None else _DEFAULT_FINISH_PREFIXES
+    if prefixes:
+        pattern = re.compile(r"^(?:" + "|".join(re.escape(p) for p in prefixes) + r")\d{2,6}$", re.IGNORECASE)
+        if pattern.match(token):
+            return True
+    return False
+
+
+def split_finish_suffix(db_code: Optional[str], cfg=None) -> tuple[str, Optional[str]]:
+    """Separates PRODUCT identity from FINISH identity in a DB code,
+    per the real examples validated against actual files:
+
+        'DB3H11328-MG007'    -> ('DB3H11328',    'MG007')
+        'DB30H5827-X-MG007'  -> ('DB30H5827-X',  'MG007')  -- the '-X'
+                                  shape/set suffix is correctly KEPT as
+                                  part of the product identity, only
+                                  the trailing finish code is split off
+        'DB1001-CUP'         -> ('DB1001-CUP',   None)     -- an
+                                  ordinary set-piece suffix (not a
+                                  finish code) is left untouched
+
+    Only the LAST hyphen-separated segment is ever considered for
+    splitting, and only when it actually looks like a finish/glaze
+    code (see _is_likely_color_suffix) -- this is what correctly
+    preserves a genuine shape suffix like '-X' while still stripping
+    a trailing '-MG007'."""
+    if not db_code or "-" not in db_code:
+        return db_code, None
+    last_hyphen = db_code.rfind("-")
+    candidate = db_code[last_hyphen + 1:].strip()
+    if candidate and _is_likely_color_suffix(candidate, cfg):
+        return db_code[:last_hyphen], candidate.upper()
+    return db_code, None
 
 
 KNOWN_FACTORY_PREFIXES = [
@@ -87,7 +141,7 @@ def _normalize_stem(filename: str) -> str:
     return stem.strip("_- ")
 
 
-def extract_signals(wb: WorkbookSummary) -> FileSignals:
+def extract_signals(wb: WorkbookSummary, cfg=None) -> FileSignals:
     sig = FileSignals(
         filename=wb.filename, path=str(wb.path), created=wb.created,
         normalized_stem=_normalize_stem(wb.filename),
@@ -106,7 +160,7 @@ def extract_signals(wb: WorkbookSummary) -> FileSignals:
             if isinstance(cell.value, str):
                 for m in FACTORY_CODE_RE.finditer(cell.value):
                     token = m.group(0).upper()
-                    if not token.startswith("DB") and not _is_likely_color_suffix(token):
+                    if not token.startswith("DB") and not _is_likely_color_suffix(token, cfg):
                         sig.factory_codes.add(token)
                 if len(cell.value) > 8 and not DB_CODE_RE.search(cell.value):
                     sig.descriptions.append(cell.value.strip())
@@ -117,6 +171,54 @@ def extract_signals(wb: WorkbookSummary) -> FileSignals:
 
     sig.has_rmb_style_pricing = has_cjk and not sig.has_db_codes and len(sig.factory_codes) > 0
     return sig
+
+
+_EMBEDDED_FACTORY_RE = re.compile(r"[A-Z]{1,2}\d{3,8}(?:-[A-Za-z0-9]+)?", re.IGNORECASE)
+
+
+def derive_factory_code_from_db_code(db_code: Optional[str], cfg=None) -> Optional[str]:
+    """When a row has NO separate factory-Part-No. cell (the compound
+    DB code is the only code present -- confirmed as a real layout in
+    actual files), derive the true factory Part No. from the DB code
+    itself:
+
+      1. Strip any trailing finish/glaze suffix first (split_finish_suffix)
+         -- e.g. 'DB30H5827-X-MG007' -> base 'DB30H5827-X'. Without this
+         step, the naive regex search below would find 'MG007' again,
+         reproducing the exact bug this function exists to fix.
+      2. Within the finish-stripped base, find the embedded letter(s)+
+         digits factory code (skipping the leading 'DB' prefix so it
+         can't match itself) -- preferring the LAST match, since the
+         factory part typically sits right before any trailing shape/
+         set suffix like '-X'.
+
+    Returns None (never invents a code) if nothing plausible is found."""
+    base, _finish = split_finish_suffix(db_code, cfg)
+    if not base:
+        return None
+    search_area = base[2:] if base.upper().startswith("DB") else base
+    matches = list(_EMBEDDED_FACTORY_RE.finditer(search_area))
+    for m in reversed(matches):
+        token = m.group(0).upper()
+        if not _is_likely_color_suffix(token, cfg):
+            return token
+    return None
+    if not a or not b:
+        return 0, None
+    try:
+        dt_a, dt_b = datetime.fromisoformat(a), datetime.fromisoformat(b)
+    except ValueError:
+        return 0, None
+    delta = abs((dt_a - dt_b).total_seconds())
+    if delta <= 60:
+        return 35, f"Created within the same minute ({a} vs {b})"
+    if delta <= 3600:
+        return 20, f"Created within the same hour ({a} vs {b})"
+    if delta <= 86400:
+        return 12, f"Created on the same day ({a} vs {b})"
+    if delta <= 7 * 86400:
+        return 5, f"Created within the same week ({a} vs {b})"
+    return 0, None
 
 
 def _timestamp_proximity_score(a: Optional[str], b: Optional[str]) -> tuple[int, Optional[str]]:

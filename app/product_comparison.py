@@ -25,7 +25,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
-from .project_matcher import FACTORY_CODE_RE, DB_CODE_RE, _is_likely_color_suffix
+from .project_matcher import (
+    FACTORY_CODE_RE, DB_CODE_RE, _is_likely_color_suffix,
+    split_finish_suffix, derive_factory_code_from_db_code,
+)
 from .file_reader import WorkbookSummary
 from .config import MatcherConfig
 from .theme_analysis import RfqThemeProfile
@@ -41,6 +44,8 @@ class ExtractedProduct:
     price: Optional[float]
     source_file: str
     row: int
+    finish_code: Optional[str] = None  # e.g. 'MG007' -- glaze/finish identity, separate from product/factory identity
+    factory_code_source: str = ""  # 'same_row_cell' (strong evidence) or 'derived_from_db_code' (weaker, inferred)
 
 
 @dataclass
@@ -67,11 +72,27 @@ class ProductComparisonRow:
     historical_needs_review: bool = False
     auto_selected: bool = True
     theme_alignment_note: str = ""
+    finish_code: str = ""
 
 
-def extract_products(wb: WorkbookSummary) -> List[ExtractedProduct]:
+def extract_products(wb: WorkbookSummary, cfg: Optional[MatcherConfig] = None) -> List[ExtractedProduct]:
+    """Per-row extraction. factory_code is found two ways, in priority
+    order (per 'same product row evidence is strongest' -- a real,
+    separate Part No. cell always wins over anything inferred):
+
+      1. A genuinely separate factory-code cell in the same row (e.g.
+         the factory's own 'Part No.' column) -- 'same_row_cell'.
+      2. If no such cell exists, DERIVED from the row's DB code itself
+         by stripping any finish/glaze suffix first (e.g. 'MG007') and
+         extracting the embedded Part No. from what's left (e.g.
+         'DB3H11328-MG007' -> 'H11328') -- 'derived_from_db_code',
+         weaker evidence, but still far better than treating the
+         finish code itself as if it were the factory code (the real
+         bug this fixes -- see project_matcher.derive_factory_code_from_db_code
+         for the full explanation)."""
     products: List[ExtractedProduct] = []
     for sheet in wb.sheets:
+        price_cols = _find_price_columns(sheet)
         rows_seen: Dict[int, dict] = defaultdict(dict)
         for cell in sheet.cells.values():
             if isinstance(cell.value, str):
@@ -79,7 +100,7 @@ def extract_products(wb: WorkbookSummary) -> List[ExtractedProduct]:
                 if db_match:
                     rows_seen[cell.row]["db_code"] = db_match.group(0).upper()
                 fc_match = FACTORY_CODE_RE.search(cell.value)
-                if fc_match and not fc_match.group(0).upper().startswith("DB") and not _is_likely_color_suffix(fc_match.group(0)):
+                if fc_match and not fc_match.group(0).upper().startswith("DB") and not _is_likely_color_suffix(fc_match.group(0), cfg):
                     rows_seen[cell.row].setdefault("factory_code", fc_match.group(0).upper())
                 if len(cell.value.strip()) > 6 and not db_match:
                     existing = rows_seen[cell.row].get("description", "")
@@ -88,22 +109,66 @@ def extract_products(wb: WorkbookSummary) -> List[ExtractedProduct]:
             elif isinstance(cell.value, (int, float)) and 0 < cell.value < 100000:
                 prices = rows_seen[cell.row].setdefault("prices", [])
                 prices.append(float(cell.value))
+                if cell.col in price_cols:
+                    price_col_values = rows_seen[cell.row].setdefault("price_col_values", [])
+                    price_col_values.append(float(cell.value))
 
         for row_num, data in rows_seen.items():
             if not data.get("db_code") and not data.get("factory_code"):
                 continue
             price = None
-            if data.get("prices"):
+            if data.get("price_col_values"):
+                # A header explicitly identified this as a price/cost
+                # column -- trust it over the generic numeric-cell guess.
+                price = min(data["price_col_values"])
+            elif data.get("prices"):
                 price = min(p for p in data["prices"] if p < 10000)
+
+            db_code = data.get("db_code")
+            factory_code = data.get("factory_code")
+            factory_code_source = "same_row_cell" if factory_code else ""
+            finish_code = None
+            if db_code:
+                _base, finish_code = split_finish_suffix(db_code, cfg)
+                if not factory_code:
+                    derived = derive_factory_code_from_db_code(db_code, cfg)
+                    if derived:
+                        factory_code = derived
+                        factory_code_source = "derived_from_db_code"
+
             products.append(ExtractedProduct(
-                factory_code=data.get("factory_code"), db_code=data.get("db_code"),
+                factory_code=factory_code, db_code=db_code,
                 description=data.get("description", ""), price=price,
                 source_file=wb.filename, row=row_num,
+                finish_code=finish_code, factory_code_source=factory_code_source,
             ))
     return products
 
 
 import re as _re
+
+_PRICE_HEADER_KEYWORDS = ("price", "cost", "rmb", "usd", "amount", "单价", "价格", "出厂价")
+_NON_PRICE_HEADER_KEYWORDS = ("no.", "item no", "stt", "qty", "quantity", "数量")
+
+
+def _find_price_columns(sheet) -> set:
+    """Scans the first few rows (where headers live) for column
+    headers that look like a price/cost column, explicitly excluding
+    anything that also looks like an item-number/quantity header --
+    prevents a header like 'Item No.' from being mistaken for a price
+    column just because 'no.' happens to share characters with
+    nothing in particular; this is a belt-and-braces exclusion, the
+    real fix is simply requiring an actual price/cost keyword match."""
+    price_cols = set()
+    for cell in sheet.cells.values():
+        if not isinstance(cell.value, str) or cell.row > 5:
+            continue
+        text = cell.value.lower()
+        if any(kw in text for kw in _NON_PRICE_HEADER_KEYWORDS):
+            continue
+        if any(kw in text for kw in _PRICE_HEADER_KEYWORDS):
+            price_cols.add(cell.col)
+    return price_cols
 
 _CODE_PREFIX_RE_CACHE: Dict[tuple, "_re.Pattern"] = {}
 
@@ -267,16 +332,29 @@ class DbCodeMappingRow:
     recommendation: str
 
 
-def build_db_code_mapping(all_comparison_rows: List[tuple]) -> List[DbCodeMappingRow]:
+def build_db_code_mapping(all_comparison_rows: List[tuple], cfg: Optional[MatcherConfig] = None) -> List[DbCodeMappingRow]:
+    """Groups by factory code, but DB codes are normalized to their
+    BASE (finish-stripped) form before counting distinct codes -- e.g.
+    'DB3H11328-MG007' and 'DB3H11328-MG006' both collapse to
+    'DB3H11328' and count as ONE product identity with two finish
+    variants, not two competing 'alternative DB codes' needing manual
+    review. This is the fix for the real false-conflict finding: MG007
+    was previously being counted as if it were a distinct product
+    mapping, inflating 'alternative DB codes' with what were actually
+    just colour/finish options of the same underlying product."""
     by_factory: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     by_factory_projects: Dict[str, Set[str]] = defaultdict(set)
+    finish_variants: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
 
     for project_label, rows in all_comparison_rows:
         for row in rows:
             if not row.factory_code or not row.db_code:
                 continue
-            by_factory[row.factory_code][row.db_code] += 1
+            base_code, finish = split_finish_suffix(row.db_code, cfg)
+            by_factory[row.factory_code][base_code] += 1
             by_factory_projects[row.factory_code].add(project_label)
+            if finish:
+                finish_variants[row.factory_code][base_code].add(finish)
 
     mapping: List[DbCodeMappingRow] = []
     for factory_code, db_code_counts in by_factory.items():
@@ -285,15 +363,18 @@ def build_db_code_mapping(all_comparison_rows: List[tuple]) -> List[DbCodeMappin
         alternatives = [code for code, _ in sorted_codes[1:]]
         total_occurrences = sum(db_code_counts.values())
 
+        primary_finishes = finish_variants[factory_code].get(primary, set())
+        finish_note = f" (finish variants seen: {', '.join(sorted(primary_finishes))})" if primary_finishes else ""
+
         if len(sorted_codes) == 1:
             confidence = "N/A -- single DB code"
-            recommendation = "No action needed."
+            recommendation = f"No action needed.{finish_note}"
         else:
             confidence = "Review" if len(alternatives) == 1 else "Review (multiple alternates)"
             recommendation = (
                 f"Factory code {factory_code} has been assigned {len(sorted_codes)} different DB codes "
                 f"across {len(by_factory_projects[factory_code])} project(s). Confirm whether these are "
-                f"the same product before treating {primary} as the sole current code."
+                f"the same product before treating {primary} as the sole current code.{finish_note}"
             )
 
         mapping.append(DbCodeMappingRow(

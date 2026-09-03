@@ -94,6 +94,7 @@ class MatcherConfig:
 
     # --- Historical evidence (spec: SOLD > QUOTED > FACTORY QUOTED > CATALOGUE) ---
     sales_report_path: str = ""  # set once the Mimosa Sales Invoice Report file is available
+    index_db_path: str = ""  # persistent Update Master index (local_index.py); defaults to next to the .exe if unset
     # Column-name mapping for the sales report. Updated to match the
     # REAL headers found in the actual uploaded Sales_Invoice_Report
     # file (validated, not guessed): there is NO separate factory-code
@@ -114,6 +115,18 @@ class MatcherConfig:
         "currency": "Sales Invoice (Product) Currency Symbol",
     })
     currency_conversion_rmb_per_usd: float = 7.2  # configurable, per instruction example
+
+    # --- Workbook provenance (content-based, since folder location
+    # alone is confirmed unreliable -- a PO/negotiation working file
+    # can be saved in the factory folder after VLOOKUP'ing old RMB
+    # costs into it for margin checking). See workbook_provenance.py. ---
+    po_negotiation_keywords: List[str] = field(default_factory=lambda: [
+        "purchase order", "po no", "po number", "deposit", "balance payment",
+        "final negotiation", "confirmed qty", "confirmed quantity", "negotiation",
+    ])
+    factory_proposal_keywords: List[str] = field(default_factory=lambda: [
+        "part no", "part number", "factory code", "出厂价", "厂价", "工厂",
+    ])
 
     # --- Security ---
     # Columns that must NEVER appear in a customer-facing export.

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import file_reader, project_matcher, product_comparison, crash_logger
-from . import theme_analysis, factory_rules, sales_history, historical_evidence, photo_extractor
+from . import theme_analysis, factory_rules, sales_history, historical_evidence, photo_extractor, workbook_provenance
 from .config import MatcherConfig
 
 logger = logging.getLogger(__name__)
@@ -163,7 +163,7 @@ def run_matching(
         crash_logger.checkpoint(f"Reading {kind} file {index}/{total}: {path.name}")
         try:
             wb = file_reader.read_workbook(path)
-            sig = project_matcher.extract_signals(wb)
+            sig = project_matcher.extract_signals(wb, cfg)
             photos = photo_extractor.extract_photos(wb, cfg, photo_store)
             stats.photos_extracted += len(photos)
         except Exception as exc:  # noqa: BLE001
@@ -197,7 +197,7 @@ def run_matching(
     db_to_factory_code: dict = {}
     for wb in factory_workbooks + customer_workbooks:
         try:
-            for p in product_comparison.extract_products(wb):
+            for p in product_comparison.extract_products(wb, cfg):
                 if p.db_code and p.factory_code and p.db_code not in db_to_factory_code:
                     db_to_factory_code[p.db_code] = p.factory_code
         except Exception as exc:  # noqa: BLE001 - cross-reference building must not abort the run
@@ -242,8 +242,8 @@ def run_matching(
         if not factory_wb or not customer_wb:
             continue
         try:
-            factory_products = product_comparison.extract_products(factory_wb)
-            customer_products = product_comparison.extract_products(customer_wb)
+            factory_products = product_comparison.extract_products(factory_wb, cfg)
+            customer_products = product_comparison.extract_products(customer_wb, cfg)
 
             # STEP: analyze the RFQ as a whole before any row matching.
             # Theme analysis needs EVERY descriptive row, coded or not
@@ -255,18 +255,36 @@ def run_matching(
             recommendation = factory_rules.recommend_factory(theme, cfg)
             _report(progress, f"{match.customer_file}: theme={theme.dominant_theme} ({theme.theme_confidence}%), recommended factory={recommendation.factory or 'none'}")
 
+            # Content-based provenance check for the factory-side file:
+            # folder location alone is NOT proof of document type (a
+            # PO/negotiation working file can be saved in the factory
+            # folder after VLOOKUP'ing old RMB costs in for margin
+            # checking). If this workbook looks like that rather than a
+            # genuine factory proposal, its cost evidence is still kept
+            # (useful historical reference, per the spec) but is NOT
+            # given full FACTORY_QUOTED trust -- downgraded to QUOTED
+            # tier and clearly labeled, so it can never silently
+            # outrank a genuine factory proposal for the same code.
+            provenance = workbook_provenance.assess_provenance(factory_wb, cfg)
+            factory_tier = historical_evidence.EvidenceTier.FACTORY_QUOTED
+            if provenance.label == "likely_po_or_negotiation_working_file":
+                factory_tier = historical_evidence.EvidenceTier.QUOTED
+                _report(progress, f"{match.factory_file}: {provenance.note}")
+
             # QUOTED / FACTORY QUOTED evidence from this project's own files.
             for p in customer_products:
                 if p.factory_code and p.db_code:
                     all_quoted_records.append(historical_evidence.HistoricalRecord(
                         factory_code=p.factory_code, db_code=p.db_code, tier=historical_evidence.EvidenceTier.QUOTED,
                         description=p.description, unit_price=p.price, date=customer_wb.created, source=p.source_file,
+                        provenance="customer_file",
                     ))
             for p in factory_products:
                 if p.factory_code and p.db_code:
                     all_quoted_records.append(historical_evidence.HistoricalRecord(
-                        factory_code=p.factory_code, db_code=p.db_code, tier=historical_evidence.EvidenceTier.FACTORY_QUOTED,
+                        factory_code=p.factory_code, db_code=p.db_code, tier=factory_tier,
                         description=p.description, unit_price=p.price, date=factory_wb.created, source=p.source_file,
+                        provenance=provenance.label,
                     ))
 
             authoritative_index = historical_evidence.build_authoritative_index(sold_records + all_quoted_records)
@@ -286,7 +304,7 @@ def run_matching(
             stats.errors.append(f"project analysis {match.factory_file}/{match.customer_file}: {exc}")
 
     crash_logger.checkpoint("Building DB code mapping...")
-    db_code_mapping = product_comparison.build_db_code_mapping(comparison_rows_for_mapping)
+    db_code_mapping = product_comparison.build_db_code_mapping(comparison_rows_for_mapping, cfg)
 
     return MatchingRunResult(
         matching=matching, project_analyses=project_analyses,

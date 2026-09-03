@@ -25,12 +25,14 @@ from PySide6.QtCore import QThread, QObject, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QProgressBar, QPlainTextEdit, QFileDialog, QMessageBox, QStatusBar,
-    QListWidget, QAbstractItemView,
+    QListWidget, QAbstractItemView, QTableWidget, QTableWidgetItem,
 )
 
 from .config import MatcherConfig, load_config, save_config
 from .orchestrator import run_matching, MatchingRunResult
 from .excel_writer import write_matching_results
+from .update_master import run_update_master, UpdateMasterResult, ReviewItem
+from . import local_index
 from . import crash_logger
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,35 @@ class MatchingWorker(QThread):
             self.failed.emit(str(exc), full_tb)
 
 
+class UpdateMasterWorker(QThread):
+    file_progress = Signal(int, int, str, float)
+    finished_ok = Signal(object)
+    failed = Signal(str, str)
+
+    def __init__(self, factory_folders: List[str], customer_folders: List[str], cfg: MatcherConfig, index_db_path: Path):
+        super().__init__()
+        self.factory_folders = factory_folders
+        self.customer_folders = customer_folders
+        self.cfg = cfg
+        self.index_db_path = index_db_path
+
+    def run(self) -> None:
+        crash_logger.checkpoint(f"UpdateMasterWorker starting: factory={self.factory_folders} customer={self.customer_folders}")
+        try:
+            result = run_update_master(
+                self.factory_folders, self.customer_folders, self.cfg, self.index_db_path,
+                on_file_progress=self.file_progress.emit,
+            )
+            crash_logger.checkpoint(f"UpdateMasterWorker finished: {result.stats.new_processed} new, "
+                                     f"{result.stats.changed_reprocessed} changed, {result.stats.mappings_requiring_review} need review")
+            self.finished_ok.emit(result)
+        except Exception as exc:  # noqa: BLE001
+            full_tb = traceback.format_exc()
+            crash_logger.write_crash_report("Exception inside UpdateMasterWorker.run()", exc)
+            logger.error("Update Master failed:\n%s", full_tb)
+            self.failed.emit(str(exc), full_tb)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config_path: str = "matcher_config.json"):
         super().__init__()
@@ -116,9 +147,11 @@ class MainWindow(QMainWindow):
         self.cfg: MatcherConfig = load_config(config_path)
         self.log_file_path = Path(config_path).resolve().parent / "Matching_Log.txt"
         self.photo_store_dir = Path(config_path).resolve().parent / "photo_store"
+        self.index_db_path = Path(self.cfg.index_db_path) if self.cfg.index_db_path else Path(config_path).resolve().parent / "master_index.db"
         self.factory_folders: List[str] = []
         self.customer_folders: List[str] = []
         self.result: Optional[MatchingRunResult] = None
+        self.update_result: Optional[UpdateMasterResult] = None
         self.worker: Optional[MatchingWorker] = None
         self.last_saved_path: Optional[Path] = None
 
@@ -183,13 +216,17 @@ class MainWindow(QMainWindow):
 
         # --- Action buttons ---
         action_row = QHBoxLayout()
-        self.btn_analyse = QPushButton("Analyse")
+        self.btn_analyse = QPushButton("Analyse (full rebuild)")
         self.btn_analyse.setEnabled(False)
         self.btn_analyse.clicked.connect(self.on_analyse)
+        self.btn_update_master = QPushButton("Update Master (daily use)")
+        self.btn_update_master.setEnabled(False)
+        self.btn_update_master.clicked.connect(self.on_update_master)
         self.btn_open_results = QPushButton("Open Results")
         self.btn_open_results.setEnabled(False)
         self.btn_open_results.clicked.connect(self.on_open_results)
         action_row.addWidget(self.btn_analyse)
+        action_row.addWidget(self.btn_update_master)
         action_row.addWidget(self.btn_open_results)
         action_row.addStretch(1)
         layout.addLayout(action_row)
@@ -205,6 +242,37 @@ class MainWindow(QMainWindow):
         self.summary_label = QLabel("")
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
+
+        # --- Update Master review table (mapping conflicts needing a decision) ---
+        self.review_table_label = QLabel("")
+        self.review_table_label.setVisible(False)
+        layout.addWidget(self.review_table_label)
+        self.review_table = QTableWidget(0, 9)
+        self.review_table.setHorizontalHeaderLabels([
+            "Factory Part No.", "Proposed DB Code", "Finish", "Description", "Source",
+            "Evidence Tier", "Confidence", "Prior Approved", "Reason",
+        ])
+        self.review_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.review_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.review_table.setMaximumHeight(220)
+        self.review_table.setVisible(False)
+        layout.addWidget(self.review_table)
+
+        review_action_row = QHBoxLayout()
+        self.btn_approve_proposed = QPushButton("Approve Proposed")
+        self.btn_approve_proposed.clicked.connect(self.on_approve_proposed)
+        self.btn_keep_existing = QPushButton("Keep Existing")
+        self.btn_keep_existing.clicked.connect(self.on_keep_existing)
+        self.btn_mark_unresolved = QPushButton("Mark Unresolved")
+        self.btn_mark_unresolved.clicked.connect(self.on_mark_unresolved)
+        review_action_row.addWidget(self.btn_approve_proposed)
+        review_action_row.addWidget(self.btn_keep_existing)
+        review_action_row.addWidget(self.btn_mark_unresolved)
+        review_action_row.addStretch(1)
+        self.review_action_row_widget = QWidget()
+        self.review_action_row_widget.setLayout(review_action_row)
+        self.review_action_row_widget.setVisible(False)
+        layout.addWidget(self.review_action_row_widget)
 
         layout.addWidget(QLabel("Status Log"))
         self.log_view = QPlainTextEdit()
@@ -233,7 +301,9 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(text)
 
     def _refresh_analyse_button(self) -> None:
-        self.btn_analyse.setEnabled(bool(self.factory_folders and self.customer_folders))
+        ready = bool(self.factory_folders and self.customer_folders)
+        self.btn_analyse.setEnabled(ready)
+        self.btn_update_master.setEnabled(ready)
 
     @_safe_slot
     def on_add_factory_folder(self) -> None:
@@ -350,6 +420,39 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     @_safe_slot
+    def on_update_master(self) -> None:
+        if not (self.factory_folders and self.customer_folders):
+            return
+        self.btn_analyse.setEnabled(False)
+        self.btn_update_master.setEnabled(False)
+        self.btn_add_factory.setEnabled(False)
+        self.btn_remove_factory.setEnabled(False)
+        self.btn_clear_factory.setEnabled(False)
+        self.btn_add_customer.setEnabled(False)
+        self.btn_remove_customer.setEnabled(False)
+        self.btn_clear_customer.setEnabled(False)
+        self.btn_select_sales_report.setEnabled(False)
+        self.btn_open_results.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.progress_detail_label.setVisible(True)
+        self.progress_detail_label.setText("Scanning folders for new/changed files...")
+        self.summary_label.setText("Updating master index...")
+        self.review_table.setVisible(False)
+        self.review_table_label.setVisible(False)
+        self.review_action_row_widget.setVisible(False)
+        self._append_log("=" * 60)
+        self._append_log(f"Starting Update Master: {len(self.factory_folders)} factory folder(s), {len(self.customer_folders)} customer folder(s)")
+        self._append_log(f"  index: {self.index_db_path}")
+        crash_logger.checkpoint("User clicked Update Master")
+
+        self.worker = UpdateMasterWorker(list(self.factory_folders), list(self.customer_folders), self.cfg, self.index_db_path)
+        self.worker.file_progress.connect(self.on_file_progress)
+        self.worker.finished_ok.connect(self.on_update_master_finished)
+        self.worker.failed.connect(self.on_update_master_failed)
+        self.worker.start()
+
+    @_safe_slot
     def on_file_progress(self, files_done: int, total: int, current_filename: str, elapsed_seconds: float) -> None:
         if total <= 0:
             return
@@ -373,6 +476,7 @@ class MainWindow(QMainWindow):
         self.btn_clear_customer.setEnabled(True)
         self.btn_select_sales_report.setEnabled(True)
         self.btn_analyse.setEnabled(True)
+        self.btn_update_master.setEnabled(True)
 
     @_safe_slot
     def on_finished(self, result: MatchingRunResult) -> None:
@@ -410,6 +514,125 @@ class MainWindow(QMainWindow):
         self._append_log(f"FATAL ERROR: {message}")
         self._append_log(full_traceback)
         QMessageBox.critical(self, "Analysis failed", f"{message}\n\nDetails written to Matching_Log.txt and Matcher_Crash_Log.txt.")
+
+    @_safe_slot
+    def on_update_master_finished(self, result: UpdateMasterResult) -> None:
+        self.update_result = result
+        self.progress_bar.setVisible(False)
+        self.progress_detail_label.setVisible(False)
+        self._reenable_folder_controls()
+
+        s = result.stats
+        self.summary_label.setText(
+            f"Files scanned: {s.files_scanned}  |  Unchanged skipped: {s.unchanged_skipped}  |  "
+            f"New processed: {s.new_processed}  |  Changed reprocessed: {s.changed_reprocessed}  |  "
+            f"New evidence added: {s.new_evidence_added}  |  "
+            f"Mappings auto-confirmed: {s.mappings_auto_confirmed}  |  "
+            f"Mappings requiring review: {s.mappings_requiring_review}"
+        )
+        self._append_log("Update Master complete.")
+        for e in s.errors:
+            self._append_log(f"ERROR: {e}")
+
+        self._populate_review_table(result.review_items)
+
+        if result.review_items:
+            QMessageBox.information(
+                self, "Update Master complete",
+                f"{s.new_processed} new file(s), {s.changed_reprocessed} changed file(s) processed. "
+                f"{len(result.review_items)} mapping(s) need your review below -- approved mappings from "
+                f"before are unaffected until you decide.",
+            )
+        else:
+            QMessageBox.information(self, "Update Master complete", "Master index updated. No mappings need review.")
+
+    @_safe_slot
+    def on_update_master_failed(self, message: str, full_traceback: str) -> None:
+        self.progress_bar.setVisible(False)
+        self.progress_detail_label.setVisible(False)
+        self._reenable_folder_controls()
+        self._append_log(f"FATAL ERROR: {message}")
+        self._append_log(full_traceback)
+        QMessageBox.critical(self, "Update Master failed", f"{message}\n\nDetails written to Matching_Log.txt and Matcher_Crash_Log.txt.")
+
+    def _populate_review_table(self, items: List[ReviewItem]) -> None:
+        self.review_table.setRowCount(0)
+        if not items:
+            self.review_table.setVisible(False)
+            self.review_table_label.setVisible(False)
+            self.review_action_row_widget.setVisible(False)
+            return
+
+        self.review_table_label.setText(
+            f"{len(items)} mapping(s) need review. Select a row, then choose an action below. "
+            f"Nothing here is applied automatically -- approved mappings are never changed without your action."
+        )
+        self.review_table_label.setVisible(True)
+        self.review_table.setVisible(True)
+        self.review_action_row_widget.setVisible(True)
+        self.review_table.setRowCount(len(items))
+        for row, item in enumerate(items):
+            values = [
+                item.factory_code, item.proposed_db_code, item.finish_code, item.description,
+                item.source, item.evidence_tier, item.confidence, item.prior_approved_mapping, item.reason,
+            ]
+            for col, value in enumerate(values):
+                self.review_table.setItem(row, col, QTableWidgetItem(value))
+        self.review_table.resizeColumnsToContents()
+
+    def _selected_review_items(self) -> List[ReviewItem]:
+        if not self.update_result:
+            return []
+        selected_rows = sorted({idx.row() for idx in self.review_table.selectedIndexes()})
+        return [self.update_result.review_items[r] for r in selected_rows if r < len(self.update_result.review_items)]
+
+    def _remove_review_rows(self, items: List[ReviewItem]) -> None:
+        if not self.update_result:
+            return
+        remove_ids = {it.item_id for it in items}
+        remaining = [it for it in self.update_result.review_items if it.item_id not in remove_ids]
+        self.update_result.review_items = remaining
+        self._populate_review_table(remaining)
+
+    @_safe_slot
+    def on_approve_proposed(self) -> None:
+        selected = self._selected_review_items()
+        if not selected:
+            return
+        for item in selected:
+            local_index.mark_mapping_reviewed(
+                item.factory_code, item.proposed_db_code,
+                note=f"Approved via review table ({item.evidence_tier} evidence, confidence {item.confidence})",
+                index_path=self.index_db_path,
+            )
+            self._append_log(f"Approved: {item.factory_code} -> {item.proposed_db_code}")
+        self._remove_review_rows(selected)
+
+    @_safe_slot
+    def on_keep_existing(self) -> None:
+        selected = self._selected_review_items()
+        if not selected:
+            return
+        for item in selected:
+            if not item.prior_approved_mapping:
+                self._append_log(f"Skipped '{item.factory_code}': no prior approved mapping to keep -- use Approve Proposed or Mark Unresolved instead.")
+                continue
+            local_index.mark_mapping_reviewed(
+                item.factory_code, item.prior_approved_mapping,
+                note="Re-confirmed existing mapping via review table; new conflicting evidence noted but not applied",
+                index_path=self.index_db_path,
+            )
+            self._append_log(f"Kept existing: {item.factory_code} -> {item.prior_approved_mapping}")
+        self._remove_review_rows([it for it in selected if it.prior_approved_mapping])
+
+    @_safe_slot
+    def on_mark_unresolved(self) -> None:
+        selected = self._selected_review_items()
+        if not selected:
+            return
+        for item in selected:
+            self._append_log(f"Marked unresolved (will reappear next Update Master run): {item.factory_code} -> {item.proposed_db_code}")
+        self._remove_review_rows(selected)
 
     @_safe_slot
     def on_open_results(self) -> None:

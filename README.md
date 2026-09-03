@@ -1,6 +1,27 @@
-# 2025 Project Matching Assistant -- TEST BUILD
+# 2025 Project Matching Assistant -- TEST BUILD 2
 
-**This is the first local validation build, not the final production version.** A completely separate application from the RFQ Master Database Extractor -- nothing in that project was touched to build this.
+**Still a TEST build, not production.** Adds the daily-use "Update
+Master" workflow on top of everything TEST BUILD 1 validated
+(multi-folder support, sales-report picker, theme/factory logic,
+MG/ND finish-code fix, evidence hierarchy, factory-cost protection).
+
+## Two ways to run it
+
+**Analyse (full rebuild)** -- unchanged from TEST BUILD 1. Reprocesses
+every file from scratch every time. Use this to validate the database
+from zero, or if you're ever unsure the incremental index is correct.
+
+**Update Master (daily use)** -- NEW. Remembers every file it's
+already processed (by content, not just name) in a local SQLite index
+(`master_index.db`, next to the `.exe` by default). On each run:
+unchanged files are skipped entirely; new files are processed; files
+whose content changed are reprocessed (their old evidence is cleanly
+replaced, not duplicated). If anything conflicts with a mapping you've
+already approved, it's surfaced in a review table below the log --
+your approved mapping is never silently changed. Review table actions:
+**Approve Proposed**, **Keep Existing**, **Mark Unresolved** (acts on
+the selected row only).
+
 
 ## For non-programmers: how to run it
 
